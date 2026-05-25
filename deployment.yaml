@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: fullstack-app
+  name: fullstack-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: fullstack-app
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: fullstack-app
+    spec:
+      containers:
+      - image: replace
+        name: devops-pipeline
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fullstack-app-service
+spec:
+  selector:
+    app: fullstack-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: LoadBalancer  

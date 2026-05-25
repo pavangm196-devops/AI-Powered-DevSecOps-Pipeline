@@ -1,0 +1,315 @@
+pipeline {
+
+    agent any
+
+    tools {
+        jdk   'java-17'
+        maven 'maven'
+    }
+
+    environment {
+
+        /* ---------------- Docker ---------------- */
+        IMAGE_NAME = "manojkrishnappa/devops-pipeline:${GIT_COMMIT}"
+
+        /* ---------------- AWS / K8s ---------------- */
+        AWS_REGION   = "ap-northeast-1"
+        CLUSTER_NAME = "quantam-cluster"
+        NAMESPACE    = "quantam"
+
+        /* ---------------- AI Configuration ---------------- */
+        OLLAMA_HOST  = "http://127.0.0.1:11434"
+        OLLAMA_MODEL = "mistral"
+
+        AI_FAIL_ON_CRITICAL = "false"
+    }
+
+    stages {
+
+    /* =====================================================
+       SOURCE
+    ===================================================== */
+
+        stage('Git Checkout') {
+            steps {
+                git url: 'https://github.com/QuntamVector/DevSecOps-AI-Powered.git',
+                    branch: 'main'
+            }
+        }
+
+    /* =====================================================
+       BUILD
+    ===================================================== */
+
+        stage('Compile') {
+            steps {
+                sh '''
+                    set -e
+                    mvn compile
+                '''
+            }
+        }
+
+    /* =====================================================
+       AI LAYER 1 — Code Review
+    ===================================================== */
+
+        stage('Ensure Ollama Model') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh '''
+                        if ollama list 2>/dev/null | grep -q "^${OLLAMA_MODEL}"; then
+                            echo "[AI] Model already exists"
+                        else
+                            echo "[AI] Pulling model..."
+                            ollama pull ${OLLAMA_MODEL}
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('AI Code Review') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    withCredentials([
+                        string(credentialsId: 'hf-api-token', variable: 'HF_API_TOKEN'),
+                        string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY')
+                    ]) {
+                        sh 'python3 scripts/ai_code_review.py'
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'ai-code-review-report.md', allowEmptyArchive: true
+                }
+            }
+        }
+
+    /* =====================================================
+       TEST + COVERAGE
+    ===================================================== */
+
+        stage('Test & Coverage') {
+            steps {
+                sh '''
+                    set -e
+                    mvn clean test jacoco:report
+                '''
+            }
+
+            post {
+                always {
+                    jacoco(
+                        execPattern: 'target/jacoco.exec',
+                        classPattern: 'target/classes',
+                        sourcePattern: 'src/main/java'
+                    )
+                }
+            }
+        }
+
+    /* =====================================================
+       STATIC CODE ANALYSIS
+    ===================================================== */
+
+        stage('SonarQube Scan') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        mvn clean package \
+                        org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 3, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+    /* =====================================================
+       OWASP DEPENDENCY SCAN
+    ===================================================== */
+
+        stage('OWASP Dependency Check') {
+            steps {
+                sh '''
+                    mvn org.owasp:dependency-check-maven:check -Dformat=ALL
+                '''
+            }
+        }
+
+    /* =====================================================
+       CONTAINER SECURITY
+    ===================================================== */
+
+        stage('Container Security & Build') {
+
+            parallel {
+
+                stage('Trivy Base Image Scan') {
+                    steps {
+                        sh 'bash trivy-docker-image-scan.sh'
+                    }
+                }
+
+                stage('OPA Dockerfile Policy') {
+                    steps {
+                        sh '''
+                        docker run --rm \
+                        -v $(pwd):/project \
+                        openpolicyagent/conftest \
+                        test --policy dockerfile-security.rego Dockerfile
+                        '''
+                    }
+                }
+
+                stage('Docker Build') {
+                    steps {
+                        sh '''
+                            set -e
+                            docker build -t ${IMAGE_NAME} .
+                        '''
+                    }
+                }
+            }
+        }
+
+    /* =====================================================
+       AI LAYER 2 — Security Analysis
+    ===================================================== */
+
+        stage('AI Security Analysis') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    withCredentials([
+                        string(credentialsId: 'hf-api-token', variable: 'HF_API_TOKEN'),
+                        string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY')
+                    ]) {
+                        sh 'python3 scripts/ai_security_analysis.py'
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'ai-security-report.md', allowEmptyArchive: true
+                }
+            }
+        }
+
+    /* =====================================================
+       DOCKER PUSH
+    ===================================================== */
+
+        stage('Docker Login') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USERNAME',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        echo $DOCKER_PASSWORD | docker login \
+                        -u $DOCKER_USERNAME --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                sh 'docker push ${IMAGE_NAME}'
+            }
+        }
+
+    /* =====================================================
+       KUBERNETES VALIDATION
+    ===================================================== */
+
+        stage('Update kubeconfig') {
+            steps {
+                sh '''
+                    aws eks update-kubeconfig \
+                    --region ${AWS_REGION} \
+                    --name ${CLUSTER_NAME}
+                '''
+            }
+        }
+
+        stage('OPA Kubernetes Policy') {
+            steps {
+                sh '''
+                docker run --rm \
+                -v $(pwd):/project \
+                openpolicyagent/conftest \
+                test --policy opa-k8s-security.rego deployment.yaml
+                '''
+            }
+        }
+
+    /* =====================================================
+       AI LAYER 3 — Release Notes
+    ===================================================== */
+
+        stage('AI Release Notes') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    withCredentials([
+                        string(credentialsId: 'hf-api-token', variable: 'HF_API_TOKEN'),
+                        string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY')
+                    ]) {
+                        sh 'python3 scripts/ai_release_notes.py'
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'ai-release-notes.md', allowEmptyArchive: true
+                }
+            }
+        }
+
+    /* =====================================================
+       DEPLOYMENT
+    ===================================================== */
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                withKubeConfig(
+                    credentialsId: 'kube',
+                    namespace: "${NAMESPACE}",
+                    restrictKubeConfigAccess: false
+                ) {
+                    sh '''
+                        echo "Updating image..."
+                        sed -i "s|replace|${IMAGE_NAME}|g" deployment.yaml
+
+                        echo "Deploying..."
+                        kubectl apply -f deployment.yaml -n ${NAMESPACE}
+                    '''
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "✅ Pipeline completed successfully"
+        }
+        unstable {
+            echo "⚠️ Pipeline completed with warnings"
+        }
+        failure {
+            echo "❌ Pipeline failed"
+        }
+    }
+}
